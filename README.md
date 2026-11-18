@@ -101,6 +101,7 @@ All settings are environment variables, usually set in `.env`. See [`.env.exampl
 - **Passwords are stored by necessity.** IMAP and SMTP need the password on every connection, so the server keeps it encrypted with `SESSION_SECRET`. Protect `.env` and `data/`. Anyone with both can decrypt the saved passwords.
 - **Signing everyone out.** Change `SESSION_SECRET`, or delete `data/sessions.json`, then restart.
 - **Expiry.** A sign-in expires after 90 days, and the user then signs in again.
+- **Password changes.** When a user changes their mailbox password, or the mailbox is disabled, the old sign-in stops working. The server checks the saved password each time the client connects, and again whenever the mail server rejects it. It then drops the sign-in and answers `401`, so the client shows the sign-in page again. If the mail server is only unreachable, nobody is signed out.
 - **Only run it behind HTTPS.** The sign-in page sends the password to this server.
 - **Logs.** The request log records only the method, path and status code. Tokens and headers are never logged.
 - **Gmail.** Gmail requires an [App Password](https://support.google.com/accounts/answer/185833) when 2-step verification is on.

@@ -71,8 +71,17 @@ function userAccount(email, password) {
   };
 }
 
-async function verifyLogin(email, password) {
-  if (!USER_IMAP_HOST) return false;
+// True only when the mail server explicitly rejected the username/password
+// (not for network errors or timeouts, which must never sign anyone out).
+function isAuthError(err) {
+  if (!err) return false;
+  if (err.authenticationFailed === true || err.code === "EAUTH") return true;
+  return /AUTHENTICATIONFAILED|authentication failed|invalid credentials/i.test(`${err.responseText || ""} ${err.message || ""}`);
+}
+
+// "ok" | "auth_failed" | "unavailable"
+async function checkLogin(email, password) {
+  if (!USER_IMAP_HOST) return "unavailable";
   const client = new ImapFlow({
     host: USER_IMAP_HOST, port: USER_IMAP_PORT, secure: USER_IMAP_SECURE,
     auth: { user: email, pass: password }, logger: false,
@@ -80,11 +89,13 @@ async function verifyLogin(email, password) {
   try {
     await client.connect();
     await client.logout().catch(() => {});
-    return true;
-  } catch {
-    return false;
+    return "ok";
+  } catch (err) {
+    return isAuthError(err) ? "auth_failed" : "unavailable";
   }
 }
+
+const verifyLogin = async (email, password) => (await checkLogin(email, password)) === "ok";
 
 async function withImap(acc, fn) {
   const client = new ImapFlow({
@@ -117,13 +128,20 @@ function textResult(obj) {
   return { content: [{ type: "text", text: JSON.stringify(obj, null, 2) }] };
 }
 
-function errorResult(err) {
-  return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
-}
-
 // accounts: { name: accountConfig } visible to this caller. A signed-in user sees only their own mailbox.
-function buildServer(accounts) {
-  const server = new McpServer({ name: "mailbox-mcp-server", version: "1.2.0" });
+// onAuthFailure: called when the mail server rejects a signed-in user's saved password (it was changed).
+function buildServer(accounts, { onAuthFailure } = {}) {
+  const server = new McpServer({ name: "mailbox-mcp-server", version: "1.3.0" });
+  const errorResult = (err) => {
+    if (onAuthFailure && isAuthError(err)) {
+      onAuthFailure();
+      return {
+        content: [{ type: "text", text: "Error: The mail server rejected the saved password - it was probably changed. You have been signed out of this connector; reconnect it and sign in with your new password." }],
+        isError: true,
+      };
+    }
+    return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
+  };
   const names = Object.keys(accounts);
   const accountEnum = z
     .enum(names)
@@ -501,14 +519,16 @@ setupOAuth(app, { baseUrl: PUBLIC_BASE_URL, verifyLogin, sessions, mailDomain: U
 const sameSecret = (a, b) =>
   crypto.timingSafeEqual(crypto.createHash("sha256").update(String(a)).digest(), crypto.createHash("sha256").update(String(b)).digest());
 
-// Bearer token -> the accounts this caller may use (null = not signed in)
-function accountsForToken(token) {
+// Bearer token -> { accounts, session } for this caller (null = not signed in)
+function callerForToken(token) {
   if (!token) return null;
-  if (AUTH_TOKEN && accountNames.length && sameSecret(token, AUTH_TOKEN)) return ACCOUNTS; // owner accounts
+  if (AUTH_TOKEN && accountNames.length && sameSecret(token, AUTH_TOKEN)) return { accounts: ACCOUNTS, session: null }; // owner accounts
   const s = sessions.get(token);
   if (!s) return null;
-  return { [s.email]: userAccount(s.email, s.password) };
+  return { accounts: { [s.email]: userAccount(s.email, s.password) }, session: s };
 }
+
+const isInitialize = (body) => (Array.isArray(body) ? body : [body]).some((m) => m && m.method === "initialize");
 
 // the MCP endpoint also answers at the bare domain, not only at /mcp
 app.use((req, _res, next) => { if (req.path === "/") req.url = "/mcp" + req.url.slice(1); next(); });
@@ -516,16 +536,30 @@ app.use((req, _res, next) => { if (req.path === "/") req.url = "/mcp" + req.url.
 app.post("/mcp", async (req, res) => {
   const authHeader = req.headers["authorization"] || "";
   const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-  const accounts = accountsForToken(token);
-  if (!accounts) {
-    // tells MCP clients where to find the OAuth details
+  const unauthorized = () => {
+    // tells MCP clients where to find the OAuth details, so they show the sign-in page again
     res.set("WWW-Authenticate", `Bearer resource_metadata="${PUBLIC_BASE_URL}/.well-known/oauth-protected-resource${req.originalUrl.startsWith("/mcp") ? "/mcp" : ""}"`);
     res.status(401).json({ error: "Unauthorized" });
-    return;
+  };
+  const caller = callerForToken(token);
+  if (!caller) return unauthorized();
+
+  // When a client (re)connects, re-check the saved password. If the mail server now rejects it,
+  // drop the sign-in and answer 401 so the client asks the user to sign in again.
+  if (caller.session && isInitialize(req.body)) {
+    const result = await checkLogin(caller.session.email, caller.session.password);
+    if (result === "auth_failed") {
+      sessions.revoke(token);
+      console.error(`saved password rejected for ${caller.session.email}: signed out`);
+      return unauthorized();
+    }
   }
 
   try {
-    const server = buildServer(accounts);
+    const onAuthFailure = caller.session
+      ? () => { sessions.revoke(token); console.error(`saved password rejected for ${caller.session.email}: signed out`); }
+      : undefined;
+    const server = buildServer(caller.accounts, { onAuthFailure });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => {
       transport.close();
