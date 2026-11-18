@@ -7,6 +7,7 @@ dotenv.config({ path: path.join(path.dirname(fileURLToPath(import.meta.url)), ".
 import express from "express";
 import crypto from "node:crypto";
 import { setupOAuth, createSessionStore } from "./oauth.js";
+import { registerMailcowTools, mailcowEnabled, mailcowReadOnly, isAdminEmail } from "./mailcow.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
@@ -122,8 +123,9 @@ function errorResult(err) {
 }
 
 // accounts: { name: accountConfig } visible to this caller. A signed-in user sees only their own mailbox.
-function buildServer(accounts) {
-  const server = new McpServer({ name: "mail-mcp-remote", version: "1.1.0" });
+// ctx: { isAdmin, userEmail } - controls which Mailcow admin / self-service tools are added
+function buildServer(accounts, ctx = {}) {
+  const server = new McpServer({ name: "mailcow-mcp", version: "1.2.0" });
   const names = Object.keys(accounts);
   const accountEnum = z
     .enum(names)
@@ -401,6 +403,67 @@ function buildServer(accounts) {
     }
   );
 
+  server.registerTool(
+    "mark_email",
+    {
+      description: "Mark emails as read/unread or flagged/unflagged.",
+      inputSchema: {
+        account: accountEnum,
+        folder: z.string().default("INBOX"),
+        uids: z.array(z.number()).min(1),
+        read: z.boolean().optional(),
+        flagged: z.boolean().optional(),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false },
+    },
+    async ({ account, folder, uids, read, flagged }) => {
+      try {
+        if (read === undefined && flagged === undefined) throw new Error("Set read and/or flagged.");
+        await withImap(acc(account), async (client) => {
+          const lock = await client.getMailboxLock(folder);
+          try {
+            if (read === true) await client.messageFlagsAdd(uids, ["\\Seen"], { uid: true });
+            if (read === false) await client.messageFlagsRemove(uids, ["\\Seen"], { uid: true });
+            if (flagged === true) await client.messageFlagsAdd(uids, ["\\Flagged"], { uid: true });
+            if (flagged === false) await client.messageFlagsRemove(uids, ["\\Flagged"], { uid: true });
+          } finally {
+            lock.release();
+          }
+        });
+        return textResult({ updated: uids.length, read, flagged });
+      } catch (err) {
+        return errorResult(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "mailbox_summary",
+    {
+      description: "Unread and total message counts for every folder - a quick overview of the mailbox.",
+      inputSchema: { account: accountEnum },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ account }) => {
+      try {
+        const rows = await withImap(acc(account), async (client) => {
+          const out = [];
+          for (const f of await client.list()) {
+            if (f.flags?.has("\\Noselect")) continue;
+            const s = await client.status(f.path, { messages: true, unseen: true }).catch(() => null);
+            if (s) out.push({ folder: f.path, messages: s.messages, unread: s.unseen });
+          }
+          return out;
+        });
+        return textResult(rows);
+      } catch (err) {
+        return errorResult(err);
+      }
+    }
+  );
+
+  registerMailcowTools(server, ctx);
+
   return server;
 }
 
@@ -442,13 +505,13 @@ setupOAuth(app, { baseUrl: PUBLIC_BASE_URL, verifyLogin, sessions, mailDomain: U
 const sameSecret = (a, b) =>
   crypto.timingSafeEqual(crypto.createHash("sha256").update(String(a)).digest(), crypto.createHash("sha256").update(String(b)).digest());
 
-// Bearer token -> the accounts this caller may use (null = not signed in)
-function accountsForToken(token) {
+// Bearer token -> { accounts, ctx } for this caller (null = not signed in)
+function callerForToken(token) {
   if (!token) return null;
-  if (AUTH_TOKEN && accountNames.length && sameSecret(token, AUTH_TOKEN)) return ACCOUNTS; // owner accounts
+  if (AUTH_TOKEN && accountNames.length && sameSecret(token, AUTH_TOKEN)) return { accounts: ACCOUNTS, ctx: { isAdmin: true } }; // owner
   const s = sessions.get(token);
   if (!s) return null;
-  return { [s.email]: userAccount(s.email, s.password) };
+  return { accounts: { [s.email]: userAccount(s.email, s.password) }, ctx: { isAdmin: isAdminEmail(s.email), userEmail: s.email } };
 }
 
 // the MCP endpoint also answers at the bare domain, not only at /mcp
@@ -457,8 +520,8 @@ app.use((req, _res, next) => { if (req.path === "/") req.url = "/mcp" + req.url.
 app.post("/mcp", async (req, res) => {
   const authHeader = req.headers["authorization"] || "";
   const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-  const accounts = accountsForToken(token);
-  if (!accounts) {
+  const caller = callerForToken(token);
+  if (!caller) {
     // tells MCP clients where to find the OAuth details
     res.set("WWW-Authenticate", `Bearer resource_metadata="${PUBLIC_BASE_URL}/.well-known/oauth-protected-resource${req.originalUrl.startsWith("/mcp") ? "/mcp" : ""}"`);
     res.status(401).json({ error: "Unauthorized" });
@@ -466,7 +529,7 @@ app.post("/mcp", async (req, res) => {
   }
 
   try {
-    const server = buildServer(accounts);
+    const server = buildServer(caller.accounts, caller.ctx);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => {
       transport.close();
@@ -492,6 +555,7 @@ const PORT = Number(process.env.PORT || "3900");
 app.listen(PORT, () => {
   console.error(
     `mail-mcp listening on :${PORT} | public URL ${PUBLIC_BASE_URL} | user sign-in: ${USER_IMAP_HOST || "off"}` +
-      ` (domain: ${USER_MAIL_DOMAIN || "any"}, saved sign-ins: ${sessions.count()}) | owner accounts: ${accountNames.join(", ") || "none"}`
+      ` (domain: ${USER_MAIL_DOMAIN || "any"}, saved sign-ins: ${sessions.count()}) | owner accounts: ${accountNames.join(", ") || "none"}` +
+      ` | mailcow API: ${mailcowEnabled ? (mailcowReadOnly ? "read-only" : "read-write") : "off"}`
   );
 });

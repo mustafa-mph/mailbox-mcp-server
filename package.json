@@ -1,7 +1,7 @@
 {
   "name": "mailcow-mcp",
-  "version": "1.1.0",
-  "description": "Remote MCP server (Streamable HTTP + OAuth) that lets each user sign in with their own IMAP/SMTP mailbox - works with Mailcow, Dovecot/Postfix, Gmail and any standard mail server",
+  "version": "1.2.0",
+  "description": "Remote MCP server for Mailcow and any IMAP/SMTP mail server: per-user mailbox sign-in (OAuth), mail tools, and optional Mailcow admin API tools",
   "type": "module",
   "main": "index.js",
   "license": "MIT",
@@ -13,7 +13,7 @@
   },
   "keywords": ["mcp", "model-context-protocol", "imap", "smtp", "email", "mailcow", "claude", "oauth"],
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.4",
+    "@modelcontextprotocol/sdk": "^1.32.0",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "imapflow": "^1.0.171",

@@ -2,6 +2,6 @@ FROM node:20-slim
 WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm install --omit=dev
-COPY index.js oauth.js ./
+COPY index.js oauth.js mailcow.js ./
 EXPOSE 3900
 CMD ["node", "index.js"]
