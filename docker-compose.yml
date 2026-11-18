@@ -1,10 +1,10 @@
-# mail-mcp - start:   docker compose up -d --build
+# mailbox-mcp-server - start:   docker compose up -d --build
 # Put a TLS reverse proxy (Caddy, Nginx, Traefik) in front of port 3900; see README.
 services:
-  mail-mcp:
+  mailbox-mcp-server:
     build: .
-    image: mail-mcp:latest
-    container_name: mail-mcp
+    image: mailbox-mcp-server:latest
+    container_name: mailbox-mcp-server
     restart: unless-stopped
     env_file: .env
     ports:

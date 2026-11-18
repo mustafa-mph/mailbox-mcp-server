@@ -7,7 +7,6 @@ dotenv.config({ path: path.join(path.dirname(fileURLToPath(import.meta.url)), ".
 import express from "express";
 import crypto from "node:crypto";
 import { setupOAuth, createSessionStore } from "./oauth.js";
-import { registerMailcowTools, mailcowEnabled, mailcowReadOnly, isAdminEmail } from "./mailcow.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
@@ -123,9 +122,8 @@ function errorResult(err) {
 }
 
 // accounts: { name: accountConfig } visible to this caller. A signed-in user sees only their own mailbox.
-// ctx: { isAdmin, userEmail } - controls which Mailcow admin / self-service tools are added
-function buildServer(accounts, ctx = {}) {
-  const server = new McpServer({ name: "mailcow-mcp", version: "1.2.0" });
+function buildServer(accounts) {
+  const server = new McpServer({ name: "mailbox-mcp-server", version: "1.2.0" });
   const names = Object.keys(accounts);
   const accountEnum = z
     .enum(names)
@@ -462,8 +460,6 @@ function buildServer(accounts, ctx = {}) {
     }
   );
 
-  registerMailcowTools(server, ctx);
-
   return server;
 }
 
@@ -505,13 +501,13 @@ setupOAuth(app, { baseUrl: PUBLIC_BASE_URL, verifyLogin, sessions, mailDomain: U
 const sameSecret = (a, b) =>
   crypto.timingSafeEqual(crypto.createHash("sha256").update(String(a)).digest(), crypto.createHash("sha256").update(String(b)).digest());
 
-// Bearer token -> { accounts, ctx } for this caller (null = not signed in)
-function callerForToken(token) {
+// Bearer token -> the accounts this caller may use (null = not signed in)
+function accountsForToken(token) {
   if (!token) return null;
-  if (AUTH_TOKEN && accountNames.length && sameSecret(token, AUTH_TOKEN)) return { accounts: ACCOUNTS, ctx: { isAdmin: true } }; // owner
+  if (AUTH_TOKEN && accountNames.length && sameSecret(token, AUTH_TOKEN)) return ACCOUNTS; // owner accounts
   const s = sessions.get(token);
   if (!s) return null;
-  return { accounts: { [s.email]: userAccount(s.email, s.password) }, ctx: { isAdmin: isAdminEmail(s.email), userEmail: s.email } };
+  return { [s.email]: userAccount(s.email, s.password) };
 }
 
 // the MCP endpoint also answers at the bare domain, not only at /mcp
@@ -520,8 +516,8 @@ app.use((req, _res, next) => { if (req.path === "/") req.url = "/mcp" + req.url.
 app.post("/mcp", async (req, res) => {
   const authHeader = req.headers["authorization"] || "";
   const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-  const caller = callerForToken(token);
-  if (!caller) {
+  const accounts = accountsForToken(token);
+  if (!accounts) {
     // tells MCP clients where to find the OAuth details
     res.set("WWW-Authenticate", `Bearer resource_metadata="${PUBLIC_BASE_URL}/.well-known/oauth-protected-resource${req.originalUrl.startsWith("/mcp") ? "/mcp" : ""}"`);
     res.status(401).json({ error: "Unauthorized" });
@@ -529,7 +525,7 @@ app.post("/mcp", async (req, res) => {
   }
 
   try {
-    const server = buildServer(caller.accounts, caller.ctx);
+    const server = buildServer(accounts);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => {
       transport.close();
@@ -554,8 +550,7 @@ app.get("/healthz", (_req, res) => res.status(200).send("ok"));
 const PORT = Number(process.env.PORT || "3900");
 app.listen(PORT, () => {
   console.error(
-    `mail-mcp listening on :${PORT} | public URL ${PUBLIC_BASE_URL} | user sign-in: ${USER_IMAP_HOST || "off"}` +
-      ` (domain: ${USER_MAIL_DOMAIN || "any"}, saved sign-ins: ${sessions.count()}) | owner accounts: ${accountNames.join(", ") || "none"}` +
-      ` | mailcow API: ${mailcowEnabled ? (mailcowReadOnly ? "read-only" : "read-write") : "off"}`
+    `mailbox-mcp-server listening on :${PORT} | public URL ${PUBLIC_BASE_URL} | user sign-in: ${USER_IMAP_HOST || "off"}` +
+      ` (domain: ${USER_MAIL_DOMAIN || "any"}, saved sign-ins: ${sessions.count()}) | owner accounts: ${accountNames.join(", ") || "none"}`
   );
 });

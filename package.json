@@ -1,7 +1,7 @@
 {
-  "name": "mailcow-mcp",
+  "name": "mailbox-mcp-server",
   "version": "1.2.0",
-  "description": "Remote MCP server for Mailcow and any IMAP/SMTP mail server: per-user mailbox sign-in (OAuth), mail tools, and optional Mailcow admin API tools",
+  "description": "Remote MCP server that lets each user sign in with their own IMAP/SMTP mailbox (OAuth) and read, search, send and organise mail from Claude - works with Mailcow, Dovecot/Postfix, Gmail and any standard mail server",
   "type": "module",
   "main": "index.js",
   "license": "MIT",
